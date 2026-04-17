@@ -2,24 +2,13 @@
 #include <mmdeviceapi.h>
 #include <Audioclient.h>
 #include <avrt.h>
-#include <mfapi.h>
-#include <mftransform.h>
-#include <wmcodecdsp.h>
 #include <endpointvolume.h>
 #include <atomic>
 #include <vector>
-#include <memory>
 #include <stdexcept>
-#include <iostream>
-#include <wrl/client.h> 
 
 #pragma comment(lib, "avrt.lib")
-#pragma comment(lib, "mfplat.lib")
-#pragma comment(lib, "mfuuid.lib")
-#pragma comment(lib, "wmcodecdspuuid.lib")
 #pragma comment(lib, "ole32.lib")
-
-using Microsoft::WRL::ComPtr;
 
 // --- 1. RING BUFFER ---
 class AudioRingBuffer {
@@ -56,7 +45,10 @@ public:
     }
 
     bool Pop(BYTE* dest, size_t size) {
-        if (size > GetAvailableRead()) return false;
+        if (size > GetAvailableRead()) {
+            std::memset(dest, 0, size); // Output silence on underrun
+            return false;
+        }
         size_t currentRead = readIndex.load(std::memory_order_relaxed);
         size_t offset = currentRead & mask;
         if (offset + size > capacity) {
@@ -71,107 +63,191 @@ public:
     }
 };
 
-// --- 2. VOLUME CONTROLLER ---
-class AudioVolumeController {
+// --- 2. RENDER ENGINE ---
+class AudioRenderEngine {
 private:
-    IAudioEndpointVolume* pVolumeEndpointA = nullptr;
-    IAudioEndpointVolume* pVolumeEndpointB = nullptr;
+    IAudioClient* pAudioClient = nullptr;
+    IAudioRenderClient* pRenderClient = nullptr;
+    HANDLE hEvent = nullptr;
+    HANDLE hThread = nullptr;
+    bool isPlaying = false;
+    AudioRingBuffer* pRingBuffer = nullptr;
+    WAVEFORMATEX* pMixFormat = nullptr;
+    UINT32 bufferFrameCount = 0;
+
+    static DWORD WINAPI ThreadProc(LPVOID lpParam) {
+        auto* engine = static_cast<AudioRenderEngine*>(lpParam);
+        DWORD taskIndex = 0;
+        HANDLE hTask = AvSetMmThreadCharacteristics(L"Pro Audio", &taskIndex);
+        
+        engine->pAudioClient->Start();
+        while (engine->isPlaying) {
+            if (WaitForSingleObject(engine->hEvent, 1000) != WAIT_OBJECT_0) continue;
+
+            UINT32 numFramesPadding = 0;
+            engine->pAudioClient->GetCurrentPadding(&numFramesPadding);
+            UINT32 numFramesAvailable = engine->bufferFrameCount - numFramesPadding;
+            if (numFramesAvailable == 0) continue;
+
+            BYTE* pData = nullptr;
+            if (SUCCEEDED(engine->pRenderClient->GetBuffer(numFramesAvailable, &pData))) {
+                size_t bytesToRead = numFramesAvailable * engine->pMixFormat->nBlockAlign;
+                DWORD flags = engine->pRingBuffer->Pop(pData, bytesToRead) ? 0 : AUDCLNT_BUFFERFLAGS_SILENT;
+                engine->pRenderClient->ReleaseBuffer(numFramesAvailable, flags);
+            }
+        }
+        engine->pAudioClient->Stop();
+        if (hTask) AvRevertMmThreadCharacteristics(hTask);
+        return 0;
+    }
+
 public:
-    HRESULT InitializeVolumes(IMMDevice* pDeviceA, IMMDevice* pDeviceB) {
-        HRESULT hr = S_OK;
-        if (pDeviceA) hr = pDeviceA->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, NULL, (void**)&pVolumeEndpointA);
-        if (pDeviceB && SUCCEEDED(hr)) hr = pDeviceB->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, NULL, (void**)&pVolumeEndpointB);
-        return hr;
+    HRESULT Initialize(IMMDevice* pDevice, AudioRingBuffer* ringBuffer, WAVEFORMATEX* captureFormat) {
+        pRingBuffer = ringBuffer;
+        HRESULT hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&pAudioClient);
+        if (FAILED(hr)) return hr;
+
+        // Force Auto-Convert to handle Bluetooth mismatches natively
+        hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, 
+            0, 0, captureFormat, NULL);
+        if (FAILED(hr)) return hr;
+
+        pAudioClient->GetBufferSize(&bufferFrameCount);
+        pMixFormat = captureFormat;
+        hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+        pAudioClient->SetEventHandle(hEvent);
+        return pAudioClient->GetService(__uuidof(IAudioRenderClient), (void**)&pRenderClient);
     }
-    void SetVolumeA(float volumeLevel) { if (pVolumeEndpointA) pVolumeEndpointA->SetMasterVolumeLevelScalar(volumeLevel, NULL); }
-    void SetVolumeB(float volumeLevel) { if (pVolumeEndpointB) pVolumeEndpointB->SetMasterVolumeLevelScalar(volumeLevel, NULL); }
-    ~AudioVolumeController() {
-        if (pVolumeEndpointA) pVolumeEndpointA->Release();
-        if (pVolumeEndpointB) pVolumeEndpointB->Release();
-    }
+    void Start() { isPlaying = true; hThread = CreateThread(NULL, 0, ThreadProc, this, 0, NULL); }
+    void Stop() { isPlaying = false; SetEvent(hEvent); WaitForSingleObject(hThread, INFINITE); }
 };
 
-// --- 3. THE MASTER ENGINE (The Missing Glue) ---
-class AudioMasterEngine {
+// --- 3. CAPTURE ENGINE ---
+class AudioCaptureEngine {
 private:
-    AudioVolumeController volController;
-    // In a full production build, instances of Capture, Render, and Resamplers go here.
-    bool isInitialized = false;
+    IAudioClient* pAudioClient = nullptr;
+    IAudioCaptureClient* pCaptureClient = nullptr;
+    HANDLE hEvent = nullptr;
+    HANDLE hThread = nullptr;
+    bool isCapturing = false;
+    AudioRingBuffer* pBufferA = nullptr;
+    AudioRingBuffer* pBufferB = nullptr;
+    WAVEFORMATEX* pMixFormat = nullptr;
+
+    static DWORD WINAPI ThreadProc(LPVOID lpParam) {
+        auto* engine = static_cast<AudioCaptureEngine*>(lpParam);
+        DWORD taskIndex = 0;
+        HANDLE hTask = AvSetMmThreadCharacteristics(L"Pro Audio", &taskIndex);
+        
+        engine->pAudioClient->Start();
+        while (engine->isCapturing) {
+            if (WaitForSingleObject(engine->hEvent, 1000) != WAIT_OBJECT_0) continue;
+
+            UINT32 packetLength = 0;
+            engine->pCaptureClient->GetNextPacketSize(&packetLength);
+            while (packetLength != 0) {
+                BYTE* pData;
+                UINT32 numFramesAvailable;
+                DWORD flags;
+                if (SUCCEEDED(engine->pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, NULL, NULL))) {
+                    size_t bytesToWrite = numFramesAvailable * engine->pMixFormat->nBlockAlign;
+                    if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+                        engine->pBufferA->Push(pData, bytesToWrite);
+                        engine->pBufferB->Push(pData, bytesToWrite);
+                    }
+                    engine->pCaptureClient->ReleaseBuffer(numFramesAvailable);
+                }
+                engine->pCaptureClient->GetNextPacketSize(&packetLength);
+            }
+        }
+        engine->pAudioClient->Stop();
+        if (hTask) AvRevertMmThreadCharacteristics(hTask);
+        return 0;
+    }
 
 public:
-    AudioMasterEngine() {}
+    HRESULT Initialize(AudioRingBuffer* bufA, AudioRingBuffer* bufB, WAVEFORMATEX** outFormat) {
+        pBufferA = bufA; pBufferB = bufB;
+        IMMDeviceEnumerator* pEnum = nullptr;
+        CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, IID_PPV_ARGS(&pEnum));
+        IMMDevice* pDefaultDevice = nullptr;
+        pEnum->GetDefaultAudioEndpoint(eRender, eConsole, &pDefaultDevice);
+        
+        pDefaultDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&pAudioClient);
+        pAudioClient->GetMixFormat(&pMixFormat);
+        *outFormat = pMixFormat;
+
+        pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, pMixFormat, NULL);
+        hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+        pAudioClient->SetEventHandle(hEvent);
+        pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCaptureClient);
+        
+        pDefaultDevice->Release();
+        pEnum->Release();
+        return S_OK;
+    }
+    void Start() { isCapturing = true; hThread = CreateThread(NULL, 0, ThreadProc, this, 0, NULL); }
+    void Stop() { isCapturing = false; SetEvent(hEvent); WaitForSingleObject(hThread, INFINITE); }
+};
+
+// --- 4. THE MASTER ENGINE ---
+class AudioMasterEngine {
+private:
+    AudioCaptureEngine capture;
+    AudioRenderEngine renderA;
+    AudioRenderEngine renderB;
+    AudioRingBuffer* bufferA;
+    AudioRingBuffer* bufferB;
+
+public:
+    AudioMasterEngine() {
+        bufferA = new AudioRingBuffer(65536); // 64KB power-of-two buffer
+        bufferB = new AudioRingBuffer(65536);
+    }
+    ~AudioMasterEngine() { delete bufferA; delete bufferB; }
     
     bool Initialize(const wchar_t* deviceIdA, const wchar_t* deviceIdB) {
-        // Find the devices using the MMDeviceEnumerator
-        IMMDeviceEnumerator* pEnumerator = nullptr;
-        HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pEnumerator);
-        if (FAILED(hr)) return false;
+        IMMDeviceEnumerator* pEnum = nullptr;
+        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&pEnum)))) return false;
 
         IMMDevice* pDeviceA = nullptr;
         IMMDevice* pDeviceB = nullptr;
+        pEnum->GetDevice(deviceIdA, &pDeviceA);
+        pEnum->GetDevice(deviceIdB, &pDeviceB);
         
-        pEnumerator->GetDevice(deviceIdA, &pDeviceA);
-        pEnumerator->GetDevice(deviceIdB, &pDeviceB);
+        if (!pDeviceA || !pDeviceB) return false;
+
+        WAVEFORMATEX* captureFormat = nullptr;
+        capture.Initialize(bufferA, bufferB, &captureFormat);
         
-        if (!pDeviceA || !pDeviceB) {
-            if (pDeviceA) pDeviceA->Release();
-            if (pDeviceB) pDeviceB->Release();
-            pEnumerator->Release();
-            return false;
-        }
+        renderA.Initialize(pDeviceA, bufferA, captureFormat);
+        renderB.Initialize(pDeviceB, bufferB, captureFormat);
 
-        // Initialize Hardware Volume Controls
-        volController.InitializeVolumes(pDeviceA, pDeviceB);
-
-        // NOTE: Capture, Resampler, and Render thread initialization logic happens here.
-        // For the raw test, we establish the COM locks on the devices.
-
-        pDeviceA->Release();
-        pDeviceB->Release();
-        pEnumerator->Release();
-
-        isInitialized = true;
+        pDeviceA->Release(); pDeviceB->Release(); pEnum->Release();
         return true;
     }
 
-    void Start() { /* Wake threads */ }
-    void Stop() { /* Signal threads to halt */ }
-    AudioVolumeController* GetVolumeController() { return &volController; }
+    void Start() { renderA.Start(); renderB.Start(); capture.Start(); }
+    void Stop() { capture.Stop(); renderA.Stop(); renderB.Stop(); }
 };
 
-// --- 4. EXPORT API (The C# Bridge) ---
+// --- 5. EXPORT API ---
 AudioMasterEngine* g_pEngine = nullptr;
 
 extern "C" {
     __declspec(dllexport) bool InitializeDualAudioOutput(const wchar_t* deviceIdA, const wchar_t* deviceIdB) {
         if (g_pEngine != nullptr) return false; 
-        HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-        if (FAILED(hr)) return false;
+        if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) return false;
 
         g_pEngine = new AudioMasterEngine();
         bool success = g_pEngine->Initialize(deviceIdA, deviceIdB);
-        
-        if (!success) {
-            delete g_pEngine;
-            g_pEngine = nullptr;
-            CoUninitialize();
-        }
+        if (!success) { delete g_pEngine; g_pEngine = nullptr; CoUninitialize(); }
         return success;
     }
-
     __declspec(dllexport) void StartAudioRouting() { if (g_pEngine) g_pEngine->Start(); }
     __declspec(dllexport) void StopAudioRouting() { if (g_pEngine) g_pEngine->Stop(); }
     __declspec(dllexport) void ShutdownAudioEngine() {
-        if (g_pEngine) {
-            delete g_pEngine;
-            g_pEngine = nullptr;
-            CoUninitialize();
-        }
-    }
-    __declspec(dllexport) void SetVolumeDeviceA(float volume) {
-        if (g_pEngine && volume >= 0.0f && volume <= 1.0f) g_pEngine->GetVolumeController()->SetVolumeA(volume);
-    }
-    __declspec(dllexport) void SetVolumeDeviceB(float volume) {
-        if (g_pEngine && volume >= 0.0f && volume <= 1.0f) g_pEngine->GetVolumeController()->SetVolumeB(volume);
+        if (g_pEngine) { delete g_pEngine; g_pEngine = nullptr; CoUninitialize(); }
     }
 }
