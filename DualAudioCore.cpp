@@ -2,7 +2,6 @@
 #include <mmdeviceapi.h>
 #include <Audioclient.h>
 #include <avrt.h>
-#include <endpointvolume.h>
 #include <atomic>
 #include <vector>
 #include <stdexcept>
@@ -10,7 +9,7 @@
 #pragma comment(lib, "avrt.lib")
 #pragma comment(lib, "ole32.lib")
 
-// --- 1. RING BUFFER ---
+// --- 1. STRICT REAL-TIME OVERWRITE BUFFER ---
 class AudioRingBuffer {
 private:
     std::vector<BYTE> buffer;
@@ -26,11 +25,19 @@ public:
         if (!IsPowerOfTwo(size)) throw std::invalid_argument("Capacity must be power of 2");
         buffer.resize(capacity, 0);
     }
+    
     size_t GetAvailableRead() const { return writeIndex.load(std::memory_order_acquire) - readIndex.load(std::memory_order_acquire); }
     size_t GetAvailableWrite() const { return capacity - GetAvailableRead(); }
 
-    bool Push(const BYTE* data, size_t size) {
-        if (size > GetAvailableWrite()) return false;
+    void Push(const BYTE* data, size_t size) {
+        // OVERWRITE LOGIC: If the buffer is too full (Target Headset is lagging),
+        // we forcefully fast-forward the read pointer to drop the oldest audio.
+        // This guarantees we NEVER suffer from "Ghost Playback" or unbounded latency.
+        if (size > GetAvailableWrite()) {
+            size_t currentRead = readIndex.load(std::memory_order_relaxed);
+            readIndex.store(currentRead + size, std::memory_order_release);
+        }
+
         size_t currentWrite = writeIndex.load(std::memory_order_relaxed);
         size_t offset = currentWrite & mask;
         if (offset + size > capacity) {
@@ -41,12 +48,11 @@ public:
             std::memcpy(buffer.data() + offset, data, size);
         }
         writeIndex.store(currentWrite + size, std::memory_order_release);
-        return true;
     }
 
     bool Pop(BYTE* dest, size_t size) {
         if (size > GetAvailableRead()) {
-            std::memset(dest, 0, size); // Output silence on underrun
+            std::memset(dest, 0, size);
             return false;
         }
         size_t currentRead = readIndex.load(std::memory_order_relaxed);
@@ -107,7 +113,6 @@ public:
         HRESULT hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&pAudioClient);
         if (FAILED(hr)) return hr;
 
-        // Force Auto-Convert to handle Bluetooth mismatches natively
         hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 
             AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, 
             0, 0, captureFormat, NULL);
@@ -131,8 +136,7 @@ private:
     HANDLE hEvent = nullptr;
     HANDLE hThread = nullptr;
     bool isCapturing = false;
-    AudioRingBuffer* pBufferA = nullptr;
-    AudioRingBuffer* pBufferB = nullptr;
+    AudioRingBuffer* pBuffer = nullptr;
     WAVEFORMATEX* pMixFormat = nullptr;
 
     static DWORD WINAPI ThreadProc(LPVOID lpParam) {
@@ -152,9 +156,13 @@ private:
                 DWORD flags;
                 if (SUCCEEDED(engine->pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, NULL, NULL))) {
                     size_t bytesToWrite = numFramesAvailable * engine->pMixFormat->nBlockAlign;
-                    if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
-                        engine->pBufferA->Push(pData, bytesToWrite);
-                        engine->pBufferB->Push(pData, bytesToWrite);
+                    
+                    // FLUSH LOGIC: If Windows says the media is paused, push instant zeroes to flush Headset B
+                    if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                        std::vector<BYTE> silence(bytesToWrite, 0);
+                        engine->pBuffer->Push(silence.data(), bytesToWrite);
+                    } else {
+                        engine->pBuffer->Push(pData, bytesToWrite);
                     }
                     engine->pCaptureClient->ReleaseBuffer(numFramesAvailable);
                 }
@@ -167,8 +175,8 @@ private:
     }
 
 public:
-    HRESULT Initialize(AudioRingBuffer* bufA, AudioRingBuffer* bufB, WAVEFORMATEX** outFormat) {
-        pBufferA = bufA; pBufferB = bufB;
+    HRESULT Initialize(AudioRingBuffer* buf, WAVEFORMATEX** outFormat) {
+        pBuffer = buf;
         IMMDeviceEnumerator* pEnum = nullptr;
         CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, IID_PPV_ARGS(&pEnum));
         IMMDevice* pDefaultDevice = nullptr;
@@ -191,7 +199,7 @@ public:
     void Stop() { isCapturing = false; SetEvent(hEvent); WaitForSingleObject(hThread, INFINITE); }
 };
 
-// --- 4. THE MASTER ENGINE (DELAY BUFFER ARCHITECTURE) ---
+// --- 4. THE MASTER ENGINE ---
 class AudioMasterEngine {
 private:
     AudioCaptureEngine capture;
@@ -200,12 +208,11 @@ private:
 
 public:
     AudioMasterEngine() {
-        // UPGRADED: 1 Megabyte buffer to comfortably hold up to 2.5 seconds of latency delay
-        buffer = new AudioRingBuffer(1048576); 
+        // TIGHT BUFFER: 256 KB. Max capacity is ~680ms. Prevents massive audio backups.
+        buffer = new AudioRingBuffer(262144); 
     }
     ~AudioMasterEngine() { delete buffer; }
     
-    // We now accept the target ID AND a millisecond delay parameter
     bool Initialize(const wchar_t* targetDeviceId, int delayMs) {
         IMMDeviceEnumerator* pEnum = nullptr;
         if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&pEnum)))) return false;
@@ -215,19 +222,15 @@ public:
         if (!pTargetDevice) return false;
 
         WAVEFORMATEX* captureFormat = nullptr;
-        capture.Initialize(buffer, buffer, &captureFormat); 
+        capture.Initialize(buffer, &captureFormat); 
         
-        // --- THE HOSTAGE BUFFER (DELAY INJECTION) ---
+        // Exact latency injection
         if (delayMs > 0 && captureFormat != nullptr) {
-            // Calculate exactly how many bytes equal 'delayMs' of audio
             size_t bytesPerSec = captureFormat->nSamplesPerSec * captureFormat->nBlockAlign;
             size_t delayBytes = (bytesPerSec * delayMs) / 1000;
-            
-            // Ensure we don't slice a frame in half (which causes horrific screeching)
             delayBytes -= (delayBytes % captureFormat->nBlockAlign);
             
             if (delayBytes <= buffer->GetAvailableWrite()) {
-                // Generate a block of pure silence and shove it into the queue first
                 std::vector<BYTE> silence(delayBytes, 0);
                 buffer->Push(silence.data(), delayBytes);
             }
@@ -247,7 +250,6 @@ public:
 AudioMasterEngine* g_pEngine = nullptr;
 
 extern "C" {
-    // API now accepts delayMs
     __declspec(dllexport) bool InitializeDualAudioOutput(const wchar_t* targetDeviceId, int delayMs) {
         if (g_pEngine != nullptr) return false; 
         if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) return false;
