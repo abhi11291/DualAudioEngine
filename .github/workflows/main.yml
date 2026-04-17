@@ -1,0 +1,26 @@
+name: Build Audio Core DLL
+
+on: 
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup MSVC Compiler
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Compile C++ DLL
+      run: cl /LD /EHsc /O2 DualAudioCore.cpp ole32.lib mfplat.lib mfuuid.lib wmcodecdspuuid.lib avrt.lib
+
+    - name: Upload DLL Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: DualAudioCore-DLL
+        path: DualAudioCore.dll
