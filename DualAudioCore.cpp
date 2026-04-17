@@ -191,7 +191,7 @@ public:
     void Stop() { isCapturing = false; SetEvent(hEvent); WaitForSingleObject(hThread, INFINITE); }
 };
 
-// --- 4. THE MASTER ENGINE (PIVOT ARCHITECTURE) ---
+// --- 4. THE MASTER ENGINE (DELAY BUFFER ARCHITECTURE) ---
 class AudioMasterEngine {
 private:
     AudioCaptureEngine capture;
@@ -200,26 +200,39 @@ private:
 
 public:
     AudioMasterEngine() {
-        buffer = new AudioRingBuffer(65536); // Single buffer
+        // UPGRADED: 1 Megabyte buffer to comfortably hold up to 2.5 seconds of latency delay
+        buffer = new AudioRingBuffer(1048576); 
     }
     ~AudioMasterEngine() { delete buffer; }
     
-    // Now we only need ONE target ID (Headset B)
-    bool Initialize(const wchar_t* targetDeviceId) {
+    // We now accept the target ID AND a millisecond delay parameter
+    bool Initialize(const wchar_t* targetDeviceId, int delayMs) {
         IMMDeviceEnumerator* pEnum = nullptr;
         if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&pEnum)))) return false;
 
         IMMDevice* pTargetDevice = nullptr;
         pEnum->GetDevice(targetDeviceId, &pTargetDevice);
-        
         if (!pTargetDevice) return false;
 
         WAVEFORMATEX* captureFormat = nullptr;
-        // Capture initializes on the Windows DEFAULT device
-        // We pass 'buffer' twice just to satisfy the old function signature for now
         capture.Initialize(buffer, buffer, &captureFormat); 
         
-        // Render pushes only to the Target device
+        // --- THE HOSTAGE BUFFER (DELAY INJECTION) ---
+        if (delayMs > 0 && captureFormat != nullptr) {
+            // Calculate exactly how many bytes equal 'delayMs' of audio
+            size_t bytesPerSec = captureFormat->nSamplesPerSec * captureFormat->nBlockAlign;
+            size_t delayBytes = (bytesPerSec * delayMs) / 1000;
+            
+            // Ensure we don't slice a frame in half (which causes horrific screeching)
+            delayBytes -= (delayBytes % captureFormat->nBlockAlign);
+            
+            if (delayBytes <= buffer->GetAvailableWrite()) {
+                // Generate a block of pure silence and shove it into the queue first
+                std::vector<BYTE> silence(delayBytes, 0);
+                buffer->Push(silence.data(), delayBytes);
+            }
+        }
+        
         renderTarget.Initialize(pTargetDevice, buffer, captureFormat);
 
         pTargetDevice->Release(); pEnum->Release();
@@ -234,13 +247,13 @@ public:
 AudioMasterEngine* g_pEngine = nullptr;
 
 extern "C" {
-    // Only accepts one ID now
-    __declspec(dllexport) bool InitializeDualAudioOutput(const wchar_t* targetDeviceId) {
+    // API now accepts delayMs
+    __declspec(dllexport) bool InitializeDualAudioOutput(const wchar_t* targetDeviceId, int delayMs) {
         if (g_pEngine != nullptr) return false; 
         if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) return false;
 
         g_pEngine = new AudioMasterEngine();
-        bool success = g_pEngine->Initialize(targetDeviceId);
+        bool success = g_pEngine->Initialize(targetDeviceId, delayMs);
         if (!success) { delete g_pEngine; g_pEngine = nullptr; CoUninitialize(); }
         return success;
     }
