@@ -191,57 +191,56 @@ public:
     void Stop() { isCapturing = false; SetEvent(hEvent); WaitForSingleObject(hThread, INFINITE); }
 };
 
-// --- 4. THE MASTER ENGINE ---
+// --- 4. THE MASTER ENGINE (PIVOT ARCHITECTURE) ---
 class AudioMasterEngine {
 private:
     AudioCaptureEngine capture;
-    AudioRenderEngine renderA;
-    AudioRenderEngine renderB;
-    AudioRingBuffer* bufferA;
-    AudioRingBuffer* bufferB;
+    AudioRenderEngine renderTarget;
+    AudioRingBuffer* buffer;
 
 public:
     AudioMasterEngine() {
-        bufferA = new AudioRingBuffer(65536); // 64KB power-of-two buffer
-        bufferB = new AudioRingBuffer(65536);
+        buffer = new AudioRingBuffer(65536); // Single buffer
     }
-    ~AudioMasterEngine() { delete bufferA; delete bufferB; }
+    ~AudioMasterEngine() { delete buffer; }
     
-    bool Initialize(const wchar_t* deviceIdA, const wchar_t* deviceIdB) {
+    // Now we only need ONE target ID (Headset B)
+    bool Initialize(const wchar_t* targetDeviceId) {
         IMMDeviceEnumerator* pEnum = nullptr;
         if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&pEnum)))) return false;
 
-        IMMDevice* pDeviceA = nullptr;
-        IMMDevice* pDeviceB = nullptr;
-        pEnum->GetDevice(deviceIdA, &pDeviceA);
-        pEnum->GetDevice(deviceIdB, &pDeviceB);
+        IMMDevice* pTargetDevice = nullptr;
+        pEnum->GetDevice(targetDeviceId, &pTargetDevice);
         
-        if (!pDeviceA || !pDeviceB) return false;
+        if (!pTargetDevice) return false;
 
         WAVEFORMATEX* captureFormat = nullptr;
-        capture.Initialize(bufferA, bufferB, &captureFormat);
+        // Capture initializes on the Windows DEFAULT device
+        // We pass 'buffer' twice just to satisfy the old function signature for now
+        capture.Initialize(buffer, buffer, &captureFormat); 
         
-        renderA.Initialize(pDeviceA, bufferA, captureFormat);
-        renderB.Initialize(pDeviceB, bufferB, captureFormat);
+        // Render pushes only to the Target device
+        renderTarget.Initialize(pTargetDevice, buffer, captureFormat);
 
-        pDeviceA->Release(); pDeviceB->Release(); pEnum->Release();
+        pTargetDevice->Release(); pEnum->Release();
         return true;
     }
 
-    void Start() { renderA.Start(); renderB.Start(); capture.Start(); }
-    void Stop() { capture.Stop(); renderA.Stop(); renderB.Stop(); }
+    void Start() { renderTarget.Start(); capture.Start(); }
+    void Stop() { capture.Stop(); renderTarget.Stop(); }
 };
 
 // --- 5. EXPORT API ---
 AudioMasterEngine* g_pEngine = nullptr;
 
 extern "C" {
-    __declspec(dllexport) bool InitializeDualAudioOutput(const wchar_t* deviceIdA, const wchar_t* deviceIdB) {
+    // Only accepts one ID now
+    __declspec(dllexport) bool InitializeDualAudioOutput(const wchar_t* targetDeviceId) {
         if (g_pEngine != nullptr) return false; 
         if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) return false;
 
         g_pEngine = new AudioMasterEngine();
-        bool success = g_pEngine->Initialize(deviceIdA, deviceIdB);
+        bool success = g_pEngine->Initialize(targetDeviceId);
         if (!success) { delete g_pEngine; g_pEngine = nullptr; CoUninitialize(); }
         return success;
     }
