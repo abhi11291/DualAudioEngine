@@ -78,7 +78,7 @@ private:
     static DWORD WINAPI ThreadProc(LPVOID lpParam) {
         auto* engine = static_cast<AudioRenderEngine*>(lpParam);
         DWORD taskIndex = 0;
-        HANDLE hTask = AvSetMmThreadCharacteristics(L"Pro Audio", &taskIndex);
+        HANDLE hTask = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
         
         engine->pAudioClient->Start();
         while (engine->isPlaying) {
@@ -138,7 +138,7 @@ private:
     static DWORD WINAPI ThreadProc(LPVOID lpParam) {
         auto* engine = static_cast<AudioCaptureEngine*>(lpParam);
         DWORD taskIndex = 0;
-        HANDLE hTask = AvSetMmThreadCharacteristics(L"Pro Audio", &taskIndex);
+        HANDLE hTask = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
         
         engine->pAudioClient->Start();
         while (engine->isCapturing) {
